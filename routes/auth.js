@@ -1,0 +1,72 @@
+const express = require('express');
+const bcrypt = require('bcrypt');
+const router = express.Router();
+const db = require('../database');
+
+// POST /register — δημιουργία λογαριασμού με αρχικό πορτοφόλι 5 credits (Γ2)
+router.post('/register', async (req, res) => {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ error: 'Όλα τα πεδία είναι υποχρεωτικά.' });
+
+    try {
+        // One-way hashing (bcrypt, cost factor 10) — ποτέ δεν αποθηκεύεται κωδικός σε plaintext
+        const saltRounds = 10;
+        const passwordHash = await bcrypt.hash(password, saltRounds);
+
+        // Transaction Boundary (Atomicity): χρήστης + bonus εγγραφής στο ledger — όλα ή τίποτα
+        db.serialize(() => {
+            db.run("BEGIN TRANSACTION");
+            const insertUserQuery = `INSERT INTO users (name, email, password_hash, credits) VALUES (?, ?, ?, 5)`;
+            
+            db.run(insertUserQuery, [name, email, passwordHash], function(err) {
+                if (err) {
+                    db.run("ROLLBACK");
+                    // Το UNIQUE constraint του email μεταφράζεται σε φιλικό 409 Conflict
+                    if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Το email υπάρχει ήδη.' });
+                    return res.status(500).json({ error: 'Σφάλμα κατά την εγγραφή.' });
+                }
+
+                const newUserId = this.lastID;
+                const ledgerQuery = `INSERT INTO credit_ledger (user_id, delta, reason) VALUES (?, 5, 'registration_bonus')`;
+                
+                db.run(ledgerQuery, [newUserId], function(err) {
+                    if (err) {
+                        db.run("ROLLBACK");
+                        return res.status(500).json({ error: 'Σφάλμα κατά την απόδοση πόντων.' });
+                    }
+                    db.run("COMMIT");
+                    res.status(201).json({ message: 'Επιτυχής εγγραφή!', userId: newUserId });
+                });
+            });
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Εσωτερικό σφάλμα διακομιστή.' });
+    }
+});
+
+// POST /login — έλεγχος διαπιστευτηρίων με bcrypt.compare· κοινό μήνυμα λάθους (κατά του user enumeration)
+router.post('/login', (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email και κωδικός είναι υποχρεωτικά.' });
+
+    const query = `SELECT id, name, password_hash, role, credits FROM users WHERE email = ?`;
+    db.get(query, [email], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Σφάλμα βάσης δεδομένων.' });
+        if (!user) return res.status(401).json({ error: 'Λάθος email ή κωδικός.' });
+
+        const match = await bcrypt.compare(password, user.password_hash);
+        if (!match) return res.status(401).json({ error: 'Λάθος email ή κωδικός.' });
+
+        res.json({ message: 'Επιτυχής σύνδεση.', user: { id: user.id, name: user.name, role: user.role, credits: user.credits } });
+    });
+});
+
+// GET /me/:id — φρέσκα στοιχεία χρήστη (πόντοι) για τον συγχρονισμό του navbar
+router.get('/me/:id', (req, res) => {
+    db.get('SELECT id, name, role, credits FROM users WHERE id = ?', [req.params.id], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: 'Χρήστης δεν βρέθηκε.' });
+        res.json({ user });
+    });
+});
+
+module.exports = router;

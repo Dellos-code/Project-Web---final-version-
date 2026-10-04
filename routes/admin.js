@@ -1,0 +1,61 @@
+const express = require('express');
+const router = express.Router();
+const db = require('../database');
+
+// Authorization middleware: επιβεβαίωση ρόλου 'admin' από τη βάση πριν από κάθε endpoint στατιστικών
+function requireAdmin(req, res, next) {
+    const userId = req.query.user_id;
+    if (!userId) return res.status(401).json({ error: 'Απαιτείται σύνδεση.' });
+    db.get(`SELECT role FROM users WHERE id = ?`, [userId], (err, user) => {
+        if (err || !user || user.role !== 'admin') return res.status(403).json({ error: 'Απαιτούνται δικαιώματα διαχειριστή.' });
+        next();
+    });
+}
+
+// Δ1 — GET /stats: επιτυχείς παραδόσεις σε κυλιόμενο παράθυρο ενός μήνα
+router.get('/stats', requireAdmin, (req, res) => {
+    const query = `
+        SELECT COUNT(*) as total_deliveries 
+        FROM deliveries 
+        WHERE status = 'completed' AND created_at >= datetime('now', '-1 month')
+    `;
+    db.get(query, [], (err, row) => {
+        if (err) return res.status(500).json({ error: 'Σφάλμα βάσης.' });
+        res.json({ total_deliveries: row ? row.total_deliveries : 0 });
+    });
+});
+
+// Δ2 — GET /leaderboard: Top-5 δωρητές (SUM μερίδων) & Top-5 γεύματα (AVG βαθμολογίας)
+router.get('/leaderboard', requireAdmin, (req, res) => {
+    const donorsQuery = `
+        SELECT u.name, SUM(p.portions_total) as total_portions_donated
+        FROM users u
+        JOIN posts p ON u.id = p.cook_id
+        WHERE p.status != 'deleted'
+        GROUP BY u.id
+        ORDER BY total_portions_donated DESC
+        LIMIT 5
+    `;
+    const mealsQuery = `
+        SELECT p.title, u.name as cook_name, AVG(r.score) as avg_score
+        FROM ratings r
+        JOIN deliveries d ON r.delivery_id = d.id
+        JOIN requests req ON d.request_id = req.id
+        JOIN posts p ON req.post_id = p.id
+        JOIN users u ON p.cook_id = u.id
+        WHERE p.status != 'deleted'
+        GROUP BY p.id
+        ORDER BY avg_score DESC
+        LIMIT 5
+    `;
+    
+    db.all(donorsQuery, [], (err, donors) => {
+        if (err) return res.status(500).json({ error: 'Σφάλμα βάσης.' });
+        db.all(mealsQuery, [], (err, meals) => {
+            if (err) return res.status(500).json({ error: 'Σφάλμα βάσης.' });
+            res.json({ donors, meals });
+        });
+    });
+});
+
+module.exports = router;
